@@ -1,20 +1,76 @@
+"""Recursive-descent parser: turns a token list into a statement/expression AST.
+
+Grammar implemented (lowest to highest precedence for expressions):
+
+    program     -> declaration* EOF ;
+    declaration -> classDecl | funDecl | varDecl | statement ;
+    classDecl   -> "class" IDENTIFIER ( "<" IDENTIFIER )?
+                   "{" ( "class"? function | getter )* "}" ;
+    funDecl     -> "fun" function ;
+    function    -> IDENTIFIER "(" parameters? ")" block ;
+    getter      -> IDENTIFIER block ;
+    parameters  -> IDENTIFIER ( "," IDENTIFIER )* ;
+    varDecl     -> "var" IDENTIFIER ( "=" expression )? ";" ;
+    statement   -> exprStmt | forStmt | ifStmt | printStmt
+                 | returnStmt | whileStmt | breakStmt | continueStmt | block ;
+    forStmt     -> "for" "(" ( varDecl | exprStmt | ";" )
+                   expression? ";" expression? ")" statement ;
+    ifStmt      -> "if" "(" expression ")" statement ( "else" statement )? ;
+    printStmt   -> "print" expression ";" ;
+    returnStmt  -> "return" expression? ";" ;
+    whileStmt   -> "while" "(" expression ")" statement ;
+    breakStmt   -> "break" ";" ;
+    continueStmt-> "continue" ";" ;
+    block       -> "{" declaration* "}" ;
+
+    expression  -> comma ;
+    comma       -> assignment ( "," assignment )* ;
+    assignment  -> ( call "." )? IDENTIFIER "=" assignment
+                 | conditional ;
+    conditional -> logic_or ( "?" expression ":" conditional )? ;
+    logic_or    -> logic_and ( "or" logic_and )* ;
+    logic_and   -> equality ( "and" equality )* ;
+    equality    -> comparison ( ( "!=" | "==" ) comparison )* ;
+    comparison  -> term ( ( ">" | ">=" | "<" | "<=" ) term )* ;
+    term        -> factor ( ( "-" | "+" ) factor )* ;
+    factor      -> unary ( ( "/" | "*" | "%" ) unary )* ;
+    unary       -> ( "!" | "-" ) unary | call ;
+    call        -> primary ( "(" arguments? ")" | "." IDENTIFIER )* ;
+    arguments   -> assignment ( "," assignment )* ;
+    primary     -> NUMBER | STRING | "true" | "false" | "nil" | "this"
+                 | "(" expression ")" | IDENTIFIER
+                 | "super" "." IDENTIFIER
+                 | "fun" "(" parameters? ")" block ;
+
+The equality/comparison/term/factor levels also detect and report a
+binary operator with no left-hand operand (e.g. stray input like
+``== 3;``), so that a single malformed line does not stop the parser
+from reporting every other error in the file.
+"""
+
 from __future__ import annotations
 
-from typing import List, Optional, Callable
+from typing import List, Optional, Sequence, Callable
 
 from .tokens import Token, TokenType
 from . import ast_nodes as ast
-from .errors import LoxParseError
+from .errors import LoxParseError, TokenErrorReporter
 
 TT = TokenType
 
+
 class Parser:
-    def __init__(self, tokens: List[Token], error_reporter):
+    """Recursive-descent parser producing a list of ``ast.Stmt`` from tokens."""
+
+    def __init__(self, tokens: List[Token], error_reporter: TokenErrorReporter) -> None:
+        """Prepare to parse ``tokens``, reporting syntax errors via ``error_reporter``."""
         self.tokens = tokens
         self.current = 0
         self.error_reporter = error_reporter
 
+    # ------------------------------------------------------------------
     def parse(self) -> List[ast.Stmt]:
+        """Parse a full program: zero or more declarations followed by EOF."""
         statements: List[ast.Stmt] = []
         while not self._is_at_end():
             decl = self._declaration()
@@ -23,6 +79,12 @@ class Parser:
         return statements
 
     def parse_single_expression(self) -> Optional[ast.Expr]:
+        """Try to parse the whole token stream as one expression.
+
+        Returns the parsed expression only if it consumes every token up
+        to EOF and no syntax error occurred; otherwise returns None. Used
+        by the REPL to decide whether a line is a bare expression.
+        """
         try:
             expr = self._expression()
             if not self._is_at_end():
@@ -31,7 +93,13 @@ class Parser:
         except LoxParseError:
             return None
 
+    # -- declarations ----------------------------------------------------
     def _declaration(self) -> Optional[ast.Stmt]:
+        """Parse one top-level or block-level declaration/statement.
+
+        On a syntax error, reports it, synchronizes to the next likely
+        statement boundary, and returns None so the caller can keep going.
+        """
         try:
             if self._match(TT.CLASS):
                 return self._class_declaration()
@@ -45,6 +113,7 @@ class Parser:
             return None
 
     def _class_declaration(self) -> ast.Stmt:
+        """Parse a class declaration, including its methods and static methods."""
         name = self._consume(TT.IDENTIFIER, "Expect class name.")
 
         superclass = None
@@ -68,6 +137,9 @@ class Parser:
         return ast.Class(name, superclass, methods, static_methods)
 
     def _function(self, kind: str) -> ast.Function:
+        """Parse a function/method declaration, or a getter if ``kind`` is
+        ``"method"`` and the name is followed directly by ``{`` (no parameter
+        list)."""
         name = self._consume(TT.IDENTIFIER, f"Expect {kind} name.")
 
         if kind == "method" and self._check(TT.LEFT_BRACE):
@@ -82,6 +154,7 @@ class Parser:
         return ast.Function(name, params, body)
 
     def _parameter_list(self) -> List[Token]:
+        """Parse a parenthesized, comma-separated parameter list (already open paren consumed)."""
         params: List[Token] = []
         if not self._check(TT.RIGHT_PAREN):
             while True:
@@ -94,6 +167,7 @@ class Parser:
         return params
 
     def _var_declaration(self) -> ast.Stmt:
+        """Parse a ``var name [= initializer];`` declaration."""
         name = self._consume(TT.IDENTIFIER, "Expect variable name.")
         initializer = None
         if self._match(TT.EQUAL):
@@ -101,7 +175,9 @@ class Parser:
         self._consume(TT.SEMICOLON, "Expect ';' after variable declaration.")
         return ast.Var(name, initializer)
 
+    # -- statements --------------------------------------------------------
     def _statement(self) -> ast.Stmt:
+        """Parse any non-declaration statement."""
         if self._match(TT.FOR):
             return self._for_statement()
         if self._match(TT.IF):
@@ -121,6 +197,7 @@ class Parser:
         return self._expression_statement()
 
     def _for_statement(self) -> ast.Stmt:
+        """Parse a ``for (init; condition; increment) body`` loop."""
         self._consume(TT.LEFT_PAREN, "Expect '(' after 'for'.")
 
         initializer: Optional[ast.Stmt]
@@ -146,6 +223,7 @@ class Parser:
         return ast.For(initializer, condition, increment, body)
 
     def _if_statement(self) -> ast.Stmt:
+        """Parse an ``if (condition) then [else else_branch]`` statement."""
         self._consume(TT.LEFT_PAREN, "Expect '(' after 'if'.")
         condition = self._expression()
         self._consume(TT.RIGHT_PAREN, "Expect ')' after if condition.")
@@ -158,11 +236,13 @@ class Parser:
         return ast.If(condition, then_branch, else_branch)
 
     def _print_statement(self) -> ast.Stmt:
+        """Parse a ``print expression;`` statement."""
         value = self._expression()
         self._consume(TT.SEMICOLON, "Expect ';' after value.")
         return ast.Print(value)
 
     def _return_statement(self) -> ast.Stmt:
+        """Parse a ``return [expression];`` statement."""
         keyword = self._previous()
         value = None
         if not self._check(TT.SEMICOLON):
@@ -171,6 +251,7 @@ class Parser:
         return ast.Return(keyword, value)
 
     def _while_statement(self) -> ast.Stmt:
+        """Parse a ``while (condition) body`` loop."""
         self._consume(TT.LEFT_PAREN, "Expect '(' after 'while'.")
         condition = self._expression()
         self._consume(TT.RIGHT_PAREN, "Expect ')' after condition.")
@@ -178,16 +259,19 @@ class Parser:
         return ast.While(condition, body)
 
     def _break_statement(self) -> ast.Stmt:
+        """Parse a ``break;`` statement."""
         keyword = self._previous()
         self._consume(TT.SEMICOLON, "Expect ';' after 'break'.")
         return ast.Break(keyword)
 
     def _continue_statement(self) -> ast.Stmt:
+        """Parse a ``continue;`` statement."""
         keyword = self._previous()
         self._consume(TT.SEMICOLON, "Expect ';' after 'continue'.")
         return ast.Continue(keyword)
 
     def _block(self) -> List[ast.Stmt]:
+        """Parse declarations up to (and consuming) the closing ``}``."""
         statements: List[ast.Stmt] = []
         while not self._check(TT.RIGHT_BRACE) and not self._is_at_end():
             decl = self._declaration()
@@ -197,14 +281,18 @@ class Parser:
         return statements
 
     def _expression_statement(self) -> ast.Stmt:
+        """Parse a bare ``expression;`` statement."""
         expr = self._expression()
         self._consume(TT.SEMICOLON, "Expect ';' after expression.")
         return ast.Expression(expr)
 
+    # -- expressions ---------------------------------------------------
     def _expression(self) -> ast.Expr:
+        """Parse an expression at the lowest precedence level (comma)."""
         return self._comma()
 
     def _comma(self) -> ast.Expr:
+        """Parse the C-style comma operator: ``a, b, c`` evaluates left to right."""
         expr = self._assignment()
         while self._match(TT.COMMA):
             right = self._assignment()
@@ -212,6 +300,7 @@ class Parser:
         return expr
 
     def _assignment(self) -> ast.Expr:
+        """Parse an assignment (``name = value`` / ``obj.name = value``) or fall through."""
         expr = self._conditional()
 
         if self._match(TT.EQUAL):
@@ -228,6 +317,7 @@ class Parser:
         return expr
 
     def _conditional(self) -> ast.Expr:
+        """Parse the ternary conditional operator ``cond ? then : else`` (right-associative)."""
         expr = self._or()
 
         if self._match(TT.QUESTION):
@@ -239,6 +329,7 @@ class Parser:
         return expr
 
     def _or(self) -> ast.Expr:
+        """Parse a short-circuiting ``or`` chain."""
         expr = self._and()
         while self._match(TT.OR):
             operator = self._previous()
@@ -247,6 +338,7 @@ class Parser:
         return expr
 
     def _and(self) -> ast.Expr:
+        """Parse a short-circuiting ``and`` chain."""
         expr = self._equality()
         while self._match(TT.AND):
             operator = self._previous()
@@ -254,7 +346,17 @@ class Parser:
             expr = ast.Logical(expr, operator, right)
         return expr
 
-    def _binary_level(self, operators, next_rule: Callable[[], ast.Expr]) -> ast.Expr:
+    # -- binary levels with leading-operator error recovery -------------
+    def _binary_level(
+        self, operators: Sequence[TokenType], next_rule: Callable[[], ast.Expr]
+    ) -> ast.Expr:
+        """Parse a left-associative binary operator level.
+
+        If the very next token is one of ``operators`` (i.e. the operator
+        appears with no left-hand operand), reports the error, parses and
+        discards a right-hand operand for recovery, and yields a
+        placeholder ``nil`` literal instead of raising.
+        """
         if self._check_any(operators):
             operator = self._peek()
             self._error(operator, f"Expect expression before '{operator.lexeme}'.")
@@ -270,14 +372,22 @@ class Parser:
         return expr
 
     def _equality(self) -> ast.Expr:
+        """Parse ``==``/``!=`` at the equality precedence level."""
         return self._binary_level((TT.BANG_EQUAL, TT.EQUAL_EQUAL), self._comparison)
 
     def _comparison(self) -> ast.Expr:
+        """Parse ``<``, ``<=``, ``>``, ``>=`` at the comparison precedence level."""
         return self._binary_level(
             (TT.GREATER, TT.GREATER_EQUAL, TT.LESS, TT.LESS_EQUAL), self._term
         )
 
     def _term(self) -> ast.Expr:
+        """Parse ``+``/``-`` at the additive precedence level.
+
+        Only a leading ``+`` is treated as a missing-left-operand error
+        here; a leading ``-`` is legitimate unary negation, so it is left
+        to ``_unary`` instead of being flagged.
+        """
         if self._check(TT.PLUS):
             operator = self._peek()
             self._error(operator, f"Expect expression before '{operator.lexeme}'.")
@@ -293,9 +403,11 @@ class Parser:
         return expr
 
     def _factor(self) -> ast.Expr:
+        """Parse ``*``, ``/``, ``%`` at the multiplicative precedence level."""
         return self._binary_level((TT.SLASH, TT.STAR, TT.PERCENT), self._unary)
 
     def _unary(self) -> ast.Expr:
+        """Parse a unary ``!`` or ``-`` expression, or fall through to a call."""
         if self._match(TT.BANG, TT.MINUS):
             operator = self._previous()
             right = self._unary()
@@ -303,6 +415,7 @@ class Parser:
         return self._call()
 
     def _call(self) -> ast.Expr:
+        """Parse a primary expression followed by any number of calls/property reads."""
         expr = self._primary()
 
         while True:
@@ -317,11 +430,15 @@ class Parser:
         return expr
 
     def _finish_call(self, callee: ast.Expr) -> ast.Expr:
+        """Parse the ``(arguments...)`` part of a call, given the opening paren was consumed."""
         arguments: List[ast.Expr] = []
         if not self._check(TT.RIGHT_PAREN):
             while True:
                 if len(arguments) >= 255:
                     self._error(self._peek(), "Can't have more than 255 arguments.")
+                # Argument expressions stop at assignment precedence, one
+                # level above comma, so that `f(1, 2)` isn't swallowed by
+                # the comma operator.
                 arguments.append(self._assignment())
                 if not self._match(TT.COMMA):
                     break
@@ -330,6 +447,7 @@ class Parser:
         return ast.Call(callee, paren, arguments)
 
     def _primary(self) -> ast.Expr:
+        """Parse a literal, identifier, grouping, ``super``/``this``, or lambda expression."""
         if self._match(TT.FALSE):
             return ast.Literal(False)
         if self._match(TT.TRUE):
@@ -363,51 +481,63 @@ class Parser:
         raise self._error(self._peek(), "Expect expression.")
 
     def _lambda_body(self) -> ast.Expr:
+        """Parse the ``(params) { body }`` part of an anonymous function, after ``fun``."""
         self._consume(TT.LEFT_PAREN, "Expect '(' after 'fun'.")
         params = self._parameter_list()
         self._consume(TT.LEFT_BRACE, "Expect '{' before lambda body.")
         body = self._block()
         return ast.Lambda(params, body)
 
+    # -- low level -------------------------------------------------------
     def _match(self, *types: TokenType) -> bool:
+        """Consume and return True if the current token is any of ``types``."""
         for t in types:
             if self._check(t):
                 self._advance()
                 return True
         return False
 
-    def _check_any(self, types) -> bool:
+    def _check_any(self, types: Sequence[TokenType]) -> bool:
+        """Return True if the current token's type is any of ``types``, without consuming."""
         return any(self._check(t) for t in types)
 
     def _check(self, token_type: TokenType) -> bool:
+        """Return True if the current token has type ``token_type``, without consuming."""
         if self._is_at_end():
             return False
         return self._peek().type == token_type
 
     def _advance(self) -> Token:
+        """Consume and return the current token."""
         if not self._is_at_end():
             self.current += 1
         return self._previous()
 
     def _is_at_end(self) -> bool:
+        """Return True once the current token is EOF."""
         return self._peek().type == TT.EOF
 
     def _peek(self) -> Token:
+        """Return the current token without consuming it."""
         return self.tokens[self.current]
 
     def _previous(self) -> Token:
+        """Return the most recently consumed token."""
         return self.tokens[self.current - 1]
 
     def _consume(self, token_type: TokenType, message: str) -> Token:
+        """Consume and return the current token if it matches ``token_type``, else error."""
         if self._check(token_type):
             return self._advance()
         raise self._error(self._peek(), message)
 
     def _error(self, token: Token, message: str) -> LoxParseError:
+        """Report a syntax error at ``token`` and return the exception to raise/discard."""
         self.error_reporter(token, message)
         return LoxParseError(message)
 
     def _synchronize(self) -> None:
+        """Discard tokens until the next likely statement boundary, after a syntax error."""
         self._advance()
         while not self._is_at_end():
             if self._previous().type == TT.SEMICOLON:

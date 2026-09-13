@@ -1,13 +1,29 @@
+"""Scanner (lexer): turns Lox source text into a flat list of tokens.
+
+The scanner performs a single left-to-right pass over the source string,
+recognizing punctuation, operators, string/number literals, identifiers
+and keywords, while skipping whitespace and both comment styles
+(``// ...`` line comments and ``/* ... */`` block comments, which may be
+nested). Any character it cannot classify is reported through the
+supplied error reporter but does not stop scanning, so later errors in
+the same file are still found in a single pass.
+"""
+
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from .tokens import Token, TokenType, KEYWORDS
+from .errors import ScanErrorReporter
 
 TT = TokenType
 
+
 class Scanner:
-    def __init__(self, source: str, error_reporter):
+    """Converts a Lox source string into a list of ``Token`` objects."""
+
+    def __init__(self, source: str, error_reporter: ScanErrorReporter) -> None:
+        """Prepare to scan ``source``, reporting lexical errors via ``error_reporter``."""
         self.source = source
         self.error_reporter = error_reporter
         self.tokens: List[Token] = []
@@ -16,6 +32,7 @@ class Scanner:
         self.line = 1
 
     def scan_tokens(self) -> List[Token]:
+        """Scan the entire source and return the resulting tokens, ending in EOF."""
         while not self._is_at_end():
             self.start = self.current
             self._scan_token()
@@ -24,6 +41,7 @@ class Scanner:
         return self.tokens
 
     def _scan_token(self) -> None:
+        """Scan a single lexeme starting at ``self.current`` and emit its token."""
         c = self._advance()
         if c == "(":
             self._add_token(TT.LEFT_PAREN)
@@ -82,6 +100,7 @@ class Scanner:
                 self.error_reporter(self.line, f"Unexpected character '{c}'.")
 
     def _block_comment(self) -> None:
+        """Consume a ``/* ... */`` comment, allowing comments to nest."""
         depth = 1
         while depth > 0:
             if self._is_at_end():
@@ -102,6 +121,7 @@ class Scanner:
             self._advance()
 
     def _string(self) -> None:
+        """Consume a double-quoted string literal and emit a STRING token."""
         while self._peek() != '"' and not self._is_at_end():
             if self._peek() == "\n":
                 self.line += 1
@@ -111,12 +131,13 @@ class Scanner:
             self.error_reporter(self.line, "Unterminated string.")
             return
 
-        self._advance()
+        self._advance()  # closing quote
 
         value = self.source[self.start + 1:self.current - 1]
         self._add_token(TT.STRING, value)
 
     def _number(self) -> None:
+        """Consume an integer or decimal literal and emit a NUMBER token."""
         while self._peek().isdigit():
             self._advance()
 
@@ -128,6 +149,7 @@ class Scanner:
         self._add_token(TT.NUMBER, float(self.source[self.start:self.current]))
 
     def _identifier(self) -> None:
+        """Consume an identifier or keyword and emit the matching token."""
         while self._peek().isalnum() or self._peek() == "_":
             self._advance()
 
@@ -136,6 +158,7 @@ class Scanner:
         self._add_token(token_type)
 
     def _match(self, expected: str) -> bool:
+        """Consume the current character and return True if it equals ``expected``."""
         if self._is_at_end():
             return False
         if self.source[self.current] != expected:
@@ -144,23 +167,28 @@ class Scanner:
         return True
 
     def _peek(self) -> str:
+        """Return the current character without consuming it, or ``'\\0'`` at EOF."""
         if self._is_at_end():
             return "\0"
         return self.source[self.current]
 
     def _peek_next(self) -> str:
+        """Return the character after the current one, or ``'\\0'`` at EOF."""
         if self.current + 1 >= len(self.source):
             return "\0"
         return self.source[self.current + 1]
 
     def _advance(self) -> str:
+        """Consume and return the current character."""
         c = self.source[self.current]
         self.current += 1
         return c
 
-    def _add_token(self, token_type: TokenType, literal=None) -> None:
+    def _add_token(self, token_type: TokenType, literal: Optional[object] = None) -> None:
+        """Append a token spanning ``self.start:self.current`` to the output."""
         text = self.source[self.start:self.current]
         self.tokens.append(Token(token_type, text, literal, self.line))
 
     def _is_at_end(self) -> bool:
+        """Return True once every character in the source has been consumed."""
         return self.current >= len(self.source)
